@@ -2,16 +2,18 @@
   'use strict';
 
   var DAY_MS = 86400000;
-  var MODEL_VERSION = 'radar-quant-v2';
+  var MODEL_VERSION = 'radar-quant-v3';
   var EXCLUDED_CATS = { 'Bridge': 1, 'Canonical Bridge': 1, 'Liquid Staking': 1, 'Liquid Restaking': 1, 'Restaked BTC': 1, 'CEX': 1 };
   var EXCHANGE_RE = /^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)\b/i;
   var VERSION_RE = /\s+(v\d+(?:\.\d+)*|\d+\.\d+)$/i;
   var WRAP_RE = /\b(wrapped|staked|staking)\b/i;
+  var YIELD_RE = /(lend|dex|yield|curator|liquid|rwa|cdp|basis|allocator|restak|staking)/i;
   var CHAIN_GAS = {
-    Ethereum: 16, Bitcoin: 6, Tron: 1.2, Avalanche: 0.35, Arbitrum: 0.25, Scroll: 0.25, Linea: 0.25,
-    Binance: 0.22, Optimism: 0.18, Base: 0.15, Berachain: 0.15, Ink: 0.12, Mantle: 0.12,
-    Polygon: 0.08, Plasma: 0.08, 'Hyperliquid L1': 0.04, Sonic: 0.04, Solana: 0.03, Sui: 0.03, Monad: 0.03
+    Ethereum: 14, Bitcoin: 5.5, Tron: 1.0, Avalanche: 0.30, Arbitrum: 0.20, Scroll: 0.20, Linea: 0.20,
+    Binance: 0.20, Optimism: 0.15, Base: 0.12, Berachain: 0.12, Ink: 0.10, Mantle: 0.10,
+    Polygon: 0.06, Plasma: 0.06, 'Hyperliquid L1': 0.04, Sonic: 0.04, Solana: 0.02, Sui: 0.02, Monad: 0.03
   };
+  var CAP_GRID = [500, 1000, 1500, 2000, 3000, 5000, 7500, 10000, 15000, 25000, 50000];
 
   function median(a) {
     if (!a.length) return 0;
@@ -31,6 +33,7 @@
   }
   function isPreToken(p) { return p.mcap_usd === null && p.gecko_id === null && p.symbol === null; }
   function isWrapperLike(p) { return !!(EXCLUDED_CATS[p.category] || EXCHANGE_RE.test(p.name) || VERSION_RE.test(p.name) || WRAP_RE.test(p.name)); }
+  function growthFeat(c7d) { return c7d === null || !isFinite(c7d) ? 0 : Math.asinh(Math.max(-90, Math.min(300, c7d)) / 25); }
 
   function classifyUniverse(snapshot) {
     var wlSet = {}, buckets = { watchlist: [], early_pre_token: [], excluded_pre_token: [], traded_mcap: [], token_meta_no_mcap: [] };
@@ -100,17 +103,30 @@
     return M.map(function (r) { return r[n]; });
   }
 
-  function fitOLS(X, y, reg) {
-    var p = X[0].length, A = [], b = [];
-    for (var j = 0; j < p; j++) { b.push(0); A.push(new Array(p).fill(0)); }
-    for (var i = 0; i < X.length; i++) {
-      for (var r = 0; r < p; r++) {
-        b[r] += X[i][r] * y[i];
-        for (var c = 0; c < p; c++) A[r][c] += X[i][r] * X[i][c];
-      }
+  function fitBaseCatAndShrink(tr, K, reg, useG, useAge) {
+    var f = fitL1Line(tr.map(function (d) { return d.logTvl; }), tr.map(function (d) { return d.y; }));
+    var cm = {}, catAdj = {};
+    tr.forEach(function (x) { (cm[x.cat] = cm[x.cat] || []).push(x.y - (f.a + f.b * x.logTvl)); });
+    Object.keys(cm).forEach(function (c) { var arr = cm[c]; catAdj[c] = median(arr) * (arr.length / (arr.length + K)); });
+    var mAge = median(tr.map(function (d) { return d.logAge; })), wg = 0, wa = 0;
+    if (useG && !useAge) {
+      var sg = reg, sy = 0;
+      tr.forEach(function (x) {
+        var r2 = x.y - (f.a + f.b * x.logTvl + (catAdj[x.cat] || 0));
+        sg += x.g * x.g; sy += x.g * r2;
+      });
+      wg = sy / sg;
+    } else if (useG && useAge) {
+      var sgg = reg, saa = reg, sga = 0, sgy = 0, say = 0;
+      tr.forEach(function (x) {
+        var r2 = x.y - (f.a + f.b * x.logTvl + (catAdj[x.cat] || 0)), ca = x.logAge - mAge;
+        sgg += x.g * x.g; saa += ca * ca; sga += x.g * ca; sgy += x.g * r2; say += ca * r2;
+      });
+      var det = sgg * saa - sga * sga;
+      wg = (saa * sgy - sga * say) / det;
+      wa = (-sga * sgy + sgg * say) / det;
     }
-    for (var k = 1; k < p; k++) A[k][k] += reg;
-    return solveLin(A, b);
+    return { a: f.a, b: f.b, catAdj: catAdj, catCounts: cm, mAge: mAge, wg: wg, wa: wa };
   }
 
   function evalCV(items, dated, fn) {
@@ -137,50 +153,54 @@
     var medA = median(comps.map(function (p) { return ageDaysOf(asOf, p.listed_at); }).filter(function (v) { return v !== null; })) || 730;
     var items = comps.map(function (p) {
       var ad = ageDaysOf(asOf, p.listed_at);
-      return { p: p, y: Math.log(p.mcap_usd), logTvl: Math.log(p.tvl_usd), g: p.change_7d === null ? 0 : Math.asinh(Math.max(-99, Math.min(500, p.change_7d)) / 20), logAge: Math.log(1 + (ad === null ? medA : ad) / 365.25), logChains: Math.log(1 + Math.max(1, (p.chains || []).length)), cat: p.category || 'Other', listedAt: p.listed_at || null };
+      return {
+        p: p, y: Math.log(p.mcap_usd), logTvl: Math.log(p.tvl_usd), g: growthFeat(p.change_7d),
+        logAge: Math.log(1 + (ad === null ? medA : ad) / 365.25),
+        logChains: Math.log(1 + Math.max(1, (p.chains || []).length)), cat: p.category || 'Other', listedAt: p.listed_at || null
+      };
     });
     var dated = items.filter(function (d) { return d.listedAt !== null; }).sort(function (a, b) { return a.listedAt < b.listedAt ? -1 : a.listedAt > b.listedAt ? 1 : 0; });
-    var K = 40, specs = [
+    var K = 40, REG = 24;
+    var specs = [
       ['flat_mult', 'Flat MCap/TVL Multiple', 'DROP', function (tr, te) { return Math.log(te.p.tvl_usd * median(tr.map(function (d) { return d.p.mcap_usd / d.p.tvl_usd; }))); }],
       ['l1_tvl', 'L1 Power-Law log(TVL)', 'KEEP', function (tr, te) { var f = fitL1Line(tr.map(function (d) { return d.logTvl; }), tr.map(function (d) { return d.y; })); return f.a + f.b * te.logTvl; }],
-      ['l1_tvl_cat', '+ Category EB (k=40)', 'KEEP', function (tr, te) {
-        var f = fitL1Line(tr.map(function (d) { return d.logTvl; }), tr.map(function (d) { return d.y; }));
-        var res = tr.filter(function (x) { return x.cat === te.cat; }).map(function (x) { return x.y - (f.a + f.b * x.logTvl); });
-        return f.a + f.b * te.logTvl + (res.length ? median(res) * (res.length / (res.length + K)) : 0);
-      }],
-      ['plus_growth', '+ 7d TVL Velocity', 'DROP', function (tr, te) { var w = fitOLS(tr.map(function (d) { return [1, d.logTvl, d.g]; }), tr.map(function (d) { return d.y; }), 4); return w[0] + w[1] * te.logTvl + w[2] * te.g; }],
-      ['plus_age', '+ Protocol Age', 'DROP', function (tr, te) { var w = fitOLS(tr.map(function (d) { return [1, d.logTvl, d.logAge]; }), tr.map(function (d) { return d.y; }), 4); return w[0] + w[1] * te.logTvl + w[2] * te.logAge; }],
-      ['plus_chains', '+ Chain Count', 'DROP', function (tr, te) { var w = fitOLS(tr.map(function (d) { return [1, d.logTvl, d.logChains]; }), tr.map(function (d) { return d.y; }), 4); return w[0] + w[1] * te.logTvl + w[2] * te.logChains; }]
+      ['l1_tvl_cat', '+ Category EB (k=40)', 'KEEP', function (tr, te) { var b = fitBaseCatAndShrink(tr, K, REG, false, false); return b.a + b.b * te.logTvl + (b.catAdj[te.cat] || 0); }],
+      ['plus_growth', '+ 7d Growth Shrinkage', 'KEEP', function (tr, te) { var b = fitBaseCatAndShrink(tr, K, REG, true, false); return b.a + b.b * te.logTvl + (b.catAdj[te.cat] || 0) + b.wg * te.g; }],
+      ['model_4sig', '+ No-Token Age (4-Signal)', 'KEEP', function (tr, te) { var b = fitBaseCatAndShrink(tr, K, REG, true, true); return b.a + b.b * te.logTvl + (b.catAdj[te.cat] || 0) + b.wg * te.g + b.wa * (te.logAge - b.mAge); }],
+      ['plus_chains', '+ Chain Count (OLS)', 'DROP', function (tr, te) {
+        var b = fitBaseCatAndShrink(tr, K, REG, false, false), mCh = median(tr.map(function (d) { return d.logChains; })), sc = 0.01, sy = 0;
+        tr.forEach(function (x) { var cc = x.logChains - mCh; sc += cc * cc; sy += cc * (x.y - (b.a + b.b * x.logTvl + (b.catAdj[x.cat] || 0))); });
+        return b.a + b.b * te.logTvl + (b.catAdj[te.cat] || 0) + (sy / sc) * (te.logChains - mCh);
+      }]
     ];
     var ablation = specs.map(function (sp) {
       var res = evalCV(items, dated, sp[3]);
       return { id: sp[0], label: sp[1], verdict: sp[2], loo_med_mult: res.loo_med_mult, loo_rmse: res.loo_rmse, wf_med_mult: res.wf_med_mult, wf_rmse: res.wf_rmse, loo_signed: res.loo_signed };
     });
-    var mainFit = fitL1Line(items.map(function (d) { return d.logTvl; }), items.map(function (d) { return d.y; })), catAdj = {}, catCounts = {};
-    items.forEach(function (d) { (catCounts[d.cat] = catCounts[d.cat] || []).push(d.y - (mainFit.a + mainFit.b * d.logTvl)); });
-    Object.keys(catCounts).forEach(function (c) { var arr = catCounts[c]; catAdj[c] = median(arr) * (arr.length / (arr.length + K)); });
-    var sRes = ablation[2].loo_signed.slice().sort(function (a, b) { return a - b; });
+    var full = fitBaseCatAndShrink(items, K, REG, true, true);
+    var sRes = ablation[4].loo_signed.slice().sort(function (a, b) { return a - b; });
     return {
-      a: mainFit.a, b: mainFit.b, eb_k: K, cat_adj: catAdj, cat_counts: catCounts, comps_count: comps.length,
+      a: full.a, b: full.b, eb_k: K, ridge_reg: REG, cat_adj: full.catAdj, cat_counts: full.catCounts,
+      wg: full.wg, wa: full.wa, med_a: medA, med_log_age: full.mAge, comps_count: comps.length,
       dated_count: dated.length, wf_test_count: dated.length - Math.floor(dated.length * 0.6),
       quantiles: { q10: quantile(sRes, 0.10), q90: quantile(sRes, 0.90) },
       ablation: ablation.map(function (r) { return { id: r.id, label: r.label, verdict: r.verdict, loo_med_mult: r.loo_med_mult, loo_rmse: r.loo_rmse, wf_med_mult: r.wf_med_mult, wf_rmse: r.wf_rmse }; })
     };
   }
 
-  function scoreValuation(p, vm, comps) {
-    var cat = p.category || 'Other', adj = vm.cat_adj[cat] || 0, catN = (vm.cat_counts[cat] || []).length;
-    var baseLog = vm.a + vm.b * Math.log(Math.max(1, p.tvl_usd)), predLog = baseLog + adj;
-    var imp = Math.max(1, Math.round(Math.exp(predLog)));
-    var low = Math.max(1, Math.round(Math.exp(predLog + vm.quantiles.q10)));
-    var high = Math.max(imp, Math.round(Math.exp(predLog + vm.quantiles.q90)));
-    var lt = Math.log(Math.max(1, p.tvl_usd));
-    var nearest = comps.map(function (c) {
-      return { slug: c.slug, name: c.name, symbol: c.symbol, category: c.category, tvl_usd: c.tvl_usd, mcap_usd: c.mcap_usd, dist: Math.abs(lt - Math.log(c.tvl_usd)) + (c.category === p.category ? 0 : 0.75) };
-    }).sort(function (a, b) { return a.dist - b.dist || b.tvl_usd - a.tvl_usd; }).slice(0, 3).map(function (c) {
-      return { slug: c.slug, name: c.name, symbol: c.symbol, category: c.category, tvl_usd: c.tvl_usd, mcap_usd: c.mcap_usd };
-    });
-    return { implied_value_usd: imp, low_usd: low, high_usd: high, base_tvl_usd: Math.round(Math.exp(baseLog)), cat_mult: rnd(Math.exp(adj), 3), cat_n: catN, nearest_comps: nearest };
+  function scoreValuation(p, vm, comps, asOf) {
+    var cat = p.category || 'Other', catAdj = vm.cat_adj[cat] || 0, catN = (vm.cat_counts[cat] || []).length;
+    var baseLog = vm.a + vm.b * Math.log(Math.max(1, p.tvl_usd)), ad = ageDaysOf(asOf, p.listed_at);
+    var gAdj = vm.wg * growthFeat(p.change_7d), ageAdj = vm.wa * (Math.log(1 + (ad === null ? vm.med_a : ad) / 365.25) - vm.med_log_age);
+    var predLog = baseLog + catAdj + gAdj + ageAdj, imp = Math.max(1, Math.round(Math.exp(predLog))), lt = Math.log(Math.max(1, p.tvl_usd));
+    var nearest = comps.map(function (c) { return { slug: c.slug, name: c.name, symbol: c.symbol, category: c.category, tvl_usd: c.tvl_usd, mcap_usd: c.mcap_usd, dist: Math.abs(lt - Math.log(c.tvl_usd)) + (c.category === p.category ? 0 : 0.75) }; })
+      .sort(function (a, b) { return a.dist - b.dist || b.tvl_usd - a.tvl_usd; }).slice(0, 3)
+      .map(function (c) { return { slug: c.slug, name: c.name, symbol: c.symbol, category: c.category, tvl_usd: c.tvl_usd, mcap_usd: c.mcap_usd }; });
+    return {
+      implied_value_usd: imp, low_usd: Math.max(1, Math.round(Math.exp(predLog + vm.quantiles.q10))), high_usd: Math.max(imp, Math.round(Math.exp(predLog + vm.quantiles.q90))),
+      base_tvl_usd: Math.round(Math.exp(baseLog)), cat_mult: rnd(Math.exp(catAdj), 3), growth_mult: rnd(Math.exp(gAdj), 3), age_mult: rnd(Math.exp(ageAdj), 3),
+      cat_n: catN, nearest_comps: nearest
+    };
   }
 
   function fitLogistic(X, y, reg) {
@@ -200,7 +220,7 @@
     return w;
   }
 
-  function fitLaunchOddsModel(snapshot, asOf) {
+  function fitPeerRateModel(snapshot, asOf) {
     var wlSet = {}, tg = {}, pre = [];
     snapshot.watchlist.forEach(function (s) { wlSet[s] = 1; });
     snapshot.protocols.forEach(function (p) {
@@ -246,78 +266,77 @@
       }
     }
     return {
-      pool_size: pool.length, token_peers: totTok, pre_peers: pool.length - totTok,
-      base_rate: rnd(totTok / pool.length, 4), mature_ceiling: rnd(mTot ? mTok / mTot : 0.85, 4),
-      age_curve: ageCurve, cat_stats: catStats,
-      cv_brier_base: rnd(bB / pool.length, 4), cv_brier_model: rnd(bM / pool.length, 4),
-      cv_logloss_base: rnd(lB / pool.length, 4), cv_logloss_model: rnd(lM / pool.length, 4)
+      pool_size: pool.length, token_peers: totTok, pre_peers: pool.length - totTok, base_rate: rnd(totTok / pool.length, 4),
+      mature_ceiling: rnd(mTot ? mTok / mTot : 0.85, 4), age_curve: ageCurve, cat_stats: catStats,
+      cv_brier_base: rnd(bB / pool.length, 4), cv_brier_model: rnd(bM / pool.length, 4), cv_logloss_base: rnd(lB / pool.length, 4), cv_logloss_model: rnd(lM / pool.length, 4)
     };
   }
-
-  function scoreLaunchOdds(p, ageDays, om) {
-    var cs = om.cat_stats[p.category || 'Other'] || { tok: 0, n: 0 };
-    var catRate = (cs.tok + 10 * om.base_rate) / (cs.n + 10);
-    var catCeil = Math.max(0.15, Math.min(0.92, om.mature_ceiling * (catRate / Math.max(0.05, om.base_rate))));
-    var cum = 0.65;
-    if (ageDays !== null) {
-      var yrs = ageDays / 365.25;
-      cum = yrs < 0.5 ? 0.12 + 0.14 * (yrs / 0.5)
-        : yrs < 1.0 ? 0.26 + 0.16 * ((yrs - 0.5) / 0.5)
-        : yrs < 2.0 ? 0.42 + 0.26 * (yrs - 1.0)
-        : yrs < 3.0 ? 0.68 + 0.18 * (yrs - 2.0)
-        : Math.min(0.95, 0.86 + 0.04 * Math.min(2, yrs - 3.0));
-    }
-    var issued = Math.min(0.95, catCeil * cum);
-    return rnd(Math.max(0.06, Math.min(0.85, (catCeil - issued) / Math.max(0.05, 1 - issued))), 3);
+  function scorePeerTokenRate(p, ageDays, om) {
+    var cs = om.cat_stats[p.category || 'Other'] || { tok: 0, n: 0 }, catRate = (cs.tok + 10 * om.base_rate) / (cs.n + 10);
+    var ageBand = ageDays === null ? 0.65 : ageDays < 180 ? 0.42 : ageDays < 365 ? 0.54 : ageDays < 730 ? 0.68 : 0.80;
+    return rnd(Math.max(0.10, Math.min(0.88, 0.6 * catRate + 0.4 * ageBand)), 3);
   }
-
   function actionSpec(p, chain) {
     var c = (p.category || '').toLowerCase();
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return { verb: 'Supply USDC collateral on ' + chain + ' with a conservative borrow loop', setupTx: 3, weeklyTx: 1, wDesc: 'repay/rebalance sync' };
-    if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('liquidity') >= 0 || c.indexOf('leveraged') >= 0) return { verb: 'Provide deep stablecoin LP on ' + chain + ' in the flagship pool', setupTx: 3, weeklyTx: 1, wDesc: 'LP range check or harvest' };
-    if (c.indexOf('perp') >= 0 || c.indexOf('deriv') >= 0 || c.indexOf('option') >= 0) return { verb: 'Deposit USDC margin on ' + chain + ' for delta-neutral maker volume', setupTx: 2, weeklyTx: 2, wDesc: 'hedged maker volume ticks' };
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0 || c.indexOf('rwa') >= 0 || c.indexOf('basis') >= 0) return { verb: 'Deposit USDC into a flagship curated vault on ' + chain + ' and hold receipt', setupTx: 2, weeklyTx: 0.5, wDesc: 'bi-weekly vault share check' };
-    if (c.indexOf('prediction') >= 0) return { verb: 'Fund USDC on ' + chain + ' and place balanced liquid market positions', setupTx: 2, weeklyTx: 2, wDesc: 'hedged weekly market entries' };
-    return { verb: 'Deposit USDC into ' + p.name + ' main vault on ' + chain + ' and hold receipt', setupTx: 2, weeklyTx: 1, wDesc: 'weekly qualifying interaction' };
+    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return { verb: 'Supply USDC collateral on ' + chain + ' with conservative LTV', setupTx: 3, weeklyTx: 1, wDesc: 'health/rebalance check' };
+    if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('liquidity') >= 0 || c.indexOf('leveraged') >= 0) return { verb: 'Provide tight stablecoin LP on ' + chain + ' in main pool', setupTx: 3, weeklyTx: 1, wDesc: 'range check or harvest' };
+    if (c.indexOf('perp') >= 0 || c.indexOf('deriv') >= 0 || c.indexOf('option') >= 0) return { verb: 'Deposit USDC margin on ' + chain + ' for delta-neutral volume', setupTx: 2, weeklyTx: 2, wDesc: 'hedged maker volume ticks' };
+    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0 || c.indexOf('rwa') >= 0 || c.indexOf('basis') >= 0) return { verb: 'Deposit USDC into flagship curated vault on ' + chain, setupTx: 2, weeklyTx: 0.5, wDesc: 'bi-weekly epoch check' };
+    if (c.indexOf('prediction') >= 0) return { verb: 'Fund USDC on ' + chain + ' and take balanced liquid market sides', setupTx: 2, weeklyTx: 2, wDesc: 'hedged weekly positions' };
+    return { verb: 'Deposit USDC into ' + p.name + ' flagship vault on ' + chain, setupTx: 2, weeklyTx: 1, wDesc: 'weekly qualifying check' };
   }
 
-  function computeFarmEconomics(p, impliedUsd, odds, depositUsd, asOf) {
+  function evalTier(p, impliedUsd, depositUsd, asOf) {
     var chain = (p.chains && p.chains.length) ? p.chains[0] : 'Ethereum';
-    var gas = CHAIN_GAS[chain] !== undefined ? CHAIN_GAS[chain] : 1.20;
+    var gas = CHAIN_GAS[chain] !== undefined ? CHAIN_GAS[chain] : 1.00;
     var spec = actionSpec(p, chain), age = ageDaysOf(asOf, p.listed_at);
-    var holdDays = (age === null ? 45 : (age < 180 ? 60 : (age < 365 ? 45 : 30))) + (p.change_7d !== null && p.change_7d > 25 ? 15 : 0);
+    var isYield = YIELD_RE.test(p.category || '');
+    var carryApr = isYield ? 0.009 : 0.035, slipRate = isYield ? 0.0010 : 0.0015;
+    var holdDays = (age === null ? 42 : (age < 180 ? 56 : (age < 365 ? 42 : 28))) + (p.change_7d !== null && p.change_7d > 25 ? 14 : 0);
     var weeks = Math.max(4, Math.round(holdDays / 7));
     var gasCost = rnd((spec.setupTx + 2 + weeks * spec.weeklyTx) * gas, 2);
-    var slip = rnd(depositUsd * 0.0015, 2), opp = rnd(depositUsd * 0.045 * (holdDays / 365), 2);
-    var totCost = rnd(gasCost + slip + opp, 2);
-    var ev = impliedUsd * odds, poolShare = 0.05 * 0.65;
-    var gross = rnd(ev * poolShare * (depositUsd / Math.max(p.tvl_usd, depositUsd)), 2);
-    var net = rnd(gross - totCost, 2), hours = rnd(0.45 + weeks * 0.12 + 0.15, 2), nph = rnd(net / hours, 2);
-    var beRate = (ev * 0.65) / Math.max(p.tvl_usd, depositUsd);
-    var bePct = beRate > 0 ? rnd((totCost / (depositUsd * beRate)) * 100, 2) : 999;
-    var yr = (ev * poolShare) / Math.max(p.tvl_usd, 1) - 0.0015 - 0.045 * (holdDays / 365);
-    var minCap = yr > 0.0005 ? Math.max(100, Math.ceil((gasCost / yr) / 50) * 50) : null;
+    var slip = rnd(depositUsd * slipRate, 2), carry = rnd(depositUsd * carryApr * (holdDays / 365), 2);
+    var totCost = rnd(gasCost + slip + carry, 2);
+    var effTvl = Math.max(p.tvl_usd, depositUsd) * (1 + Math.max(0, Math.min(200, p.change_7d || 0)) / 200);
+    var estWallets = Math.max(300, Math.round(Math.pow(effTvl / 5e3, 0.78)));
+    var tvlShare = depositUsd / effTvl;
+    var actShare = (Math.log10(1 + depositUsd / 1000) / Math.log10(26)) / estWallets;
+    var earlyMult = age === null ? 0.90 : (age < 180 ? 1.25 : age < 365 ? 1.10 : age < 730 ? 0.95 : 0.80);
+    var userShare = Math.min(0.004, (0.85 * tvlShare + 0.15 * actShare) * earlyMult);
+    var gross = rnd(impliedUsd * 0.05 * userShare, 2);
+    var net = rnd(gross - totCost, 2), hours = rnd(0.4 + weeks * 0.1 + 0.2, 2), nph = rnd(net / hours, 2);
+    var bePct = gross > 0 ? rnd((totCost / gross) * 5.0, 2) : 999;
     return {
-      chain: chain, gas_per_tx: gas, hold_days: holdDays, weeks: weeks,
-      gas_cost_usd: gasCost, total_cost_usd: totCost, opp_cost_usd: opp, slippage_usd: slip,
-      gross_usd: gross, net_usd: net, total_hours: hours, net_per_hour: nph,
-      breakeven_pool_pct: bePct, min_viable_usd: minCap,
-      verdict: net <= 0 ? 'SKIP' : (nph >= 20 ? 'FARM' : 'THIN'), spec: spec
+      chain: chain, gas_per_tx: gas, hold_days: holdDays, weeks: weeks, is_yield: isYield, carry_apr: carryApr,
+      gas_cost_usd: gasCost, total_cost_usd: totCost, opp_cost_usd: carry, slippage_usd: slip,
+      gross_usd: gross, net_usd: net, total_hours: hours, net_per_hour: nph, breakeven_pool_pct: bePct,
+      verdict: net <= 0 ? 'SKIP' : (nph >= 25 ? 'FARM' : 'VIABLE'), spec: spec
     };
   }
 
-  function buildFarmSteps(p, impliedUsd, odds, asOf) {
-    var e5 = computeFarmEconomics(p, impliedUsd, odds, 5000, asOf);
+  function computeFarmEconomics(p, impliedUsd, depositUsd, asOf) {
+    var e = evalTier(p, impliedUsd, depositUsd, asOf), minCap = null;
+    for (var i = 0; i < CAP_GRID.length; i++) {
+      if (evalTier(p, impliedUsd, CAP_GRID[i], asOf).net_usd > 0) { minCap = CAP_GRID[i]; break; }
+    }
+    e.min_viable_usd = minCap;
+    return e;
+  }
+
+  function buildFarmSteps(p, impliedUsd, peerRate, asOf) {
+    var e5 = computeFarmEconomics(p, impliedUsd, 5000, asOf);
     var cap = e5.verdict === 'FARM' ? 5000 : (e5.min_viable_usd ? Math.max(1000, Math.min(25000, e5.min_viable_usd)) : 5000);
-    var e = computeFarmEconomics(p, impliedUsd, odds, cap, asOf);
-    var dil = p.change_7d !== null && p.change_7d > 25 ? 'TVL +' + rnd(p.change_7d, 1) + '% 7d dilution alert' : 'steady 7d TVL';
+    var e = computeFarmEconomics(p, impliedUsd, cap, asOf);
+    var dil = p.change_7d !== null && p.change_7d > 25 ? '7d TVL +' + rnd(p.change_7d, 1) + '% dilution watch' : 'steady 7d TVL';
+    var carryLbl = e.is_yield ? '0.9% APR risk buffer' : '3.5% APR idle carry';
+    var cadDesc = e.spec.weeklyTx < 1 ? e.spec.wDesc : e.spec.weeklyTx + ' ' + e.spec.wDesc + '/wk';
     return [
-      'Isolate a ' + e.chain + ' wallet with $' + cap + ' USDC + $' + Math.max(2, Math.ceil(e.gas_cost_usd + 2)) + ' gas ($' + e.gas_per_tx.toFixed(2) + '/tx). Cost: ~$' + e.gas_per_tx.toFixed(2) + '. Time: 10 minutes.',
-      e.spec.verb + ' in ' + p.name + ' with $' + cap + ' (' + e.spec.setupTx + ' setup txs). Cost: $' + cap + ' + $' + rnd(e.spec.setupTx * e.gas_per_tx + e.slippage_usd, 2) + ' gas/slip. Time: 15 minutes.',
-      'Run ' + e.spec.weeklyTx + ' ' + e.spec.wDesc + '/wk for ' + e.weeks + ' weeks across epochs. Cost: ~$' + rnd(e.weeks * e.spec.weeklyTx * e.gas_per_tx, 2) + ' gas. Time: 7 minutes/week.',
-      'Hold ' + e.hold_days + 'd (' + dil + '; exit if TVL doubles without points boost). Cost: $' + e.opp_cost_usd.toFixed(2) + ' opp cost (4.5% APR). Time: ' + e.hold_days + ' days.',
-      'Break-even: needs ' + e.breakeven_pool_pct + '% airdrop pool at $' + cap + ' (' + e.verdict + ', $' + e.net_per_hour + '/hr net). Cost: $0 audit. Time: 5 minutes/week.',
-      'Verify official ' + p.name + ' claim contract before withdrawing (' + Math.round(odds * 100) + '% peer odds). Cost: ~$' + rnd(2 * e.gas_per_tx, 2) + ' exit gas. Time: 10 minutes.'
+      'Pre-Launch Setup: Fund isolated ' + e.chain + ' wallet with $' + cap + ' USDC + $' + Math.max(2, Math.ceil(e.gas_cost_usd + 2)) + ' gas ($' + e.gas_per_tx.toFixed(2) + '/tx). Cost: ~$' + e.gas_per_tx.toFixed(2) + '. Time: 10 minutes.',
+      'Pre-Launch Position: ' + e.spec.verb + ' ($' + cap + ', ' + e.spec.setupTx + ' txs). Cost: ~$' + rnd(e.spec.setupTx * e.gas_per_tx + e.slippage_usd, 2) + ' gas/slip. Time: 15 minutes.',
+      'Pre-Launch Cadence: Run ' + cadDesc + ' for ' + e.weeks + ' wks (' + e.hold_days + 'd, ' + dil + '). Cost: ~$' + rnd(e.weeks * e.spec.weeklyTx * e.gas_per_tx, 2) + ' gas + $' + e.opp_cost_usd.toFixed(2) + ' (' + carryLbl + '). Time: 6 minutes/week.',
+      'Break-Even & Sizing: Conditional 5% TGE pool requires ' + e.breakeven_pool_pct + '% pool share at $' + cap + ' (' + e.verdict + ', $' + e.net_per_hour + '/hr). Cost: $0 audit. Time: 5 minutes/week.',
+      'Post-Launch TGE Claim: If ' + p.name + ' issues a token (' + Math.round(peerRate * 100) + '% peer rate), verify Merkle claim contract on ' + e.chain + ' and claim tranche. Cost: ~$' + rnd(e.gas_per_tx, 2) + ' gas. Time: 12 minutes.',
+      'Post-Launch Exit / LP: Unwind vault or migrate rewards into Day-2 DEX LP once spread normalizes; revoke approvals. Cost: ~$' + rnd(e.gas_per_tx + e.slippage_usd * 0.5, 2) + ' gas/slip. Time: 15 minutes.'
     ].map(function (s) { return s.length > 600 ? s.slice(0, 596) + '...' : s; });
   }
 
@@ -332,16 +351,16 @@
 
   function buildRadar(snapshot) {
     var uni = classifyUniverse(snapshot), comps = buildTickerComps(snapshot);
-    var vm = fitValuationModel(comps, snapshot.as_of), om = fitLaunchOddsModel(snapshot, snapshot.as_of);
+    var vm = fitValuationModel(comps, snapshot.as_of), om = fitPeerRateModel(snapshot, snapshot.as_of);
     var scored = uni.buckets.watchlist.concat(uni.buckets.early_pre_token).map(function (p) {
-      var val = scoreValuation(p, vm, comps), age = ageDaysOf(snapshot.as_of, p.listed_at);
-      var odds = scoreLaunchOdds(p, age, om), ev = Math.max(1, Math.round(val.implied_value_usd * odds));
+      var val = scoreValuation(p, vm, comps, snapshot.as_of), age = ageDaysOf(snapshot.as_of, p.listed_at);
+      var rate = scorePeerTokenRate(p, age, om), ev = Math.max(1, Math.round(val.implied_value_usd * rate));
       return {
-        p: p, scope: uni.wlSet[p.slug] ? 'watchlist' : 'early', age_days: age, val: val, odds: odds, ev: ev,
-        t1: stripSpec(computeFarmEconomics(p, val.implied_value_usd, odds, 1000, snapshot.as_of)),
-        t5: stripSpec(computeFarmEconomics(p, val.implied_value_usd, odds, 5000, snapshot.as_of)),
-        t25: stripSpec(computeFarmEconomics(p, val.implied_value_usd, odds, 25000, snapshot.as_of)),
-        steps: buildFarmSteps(p, val.implied_value_usd, odds, snapshot.as_of)
+        p: p, scope: uni.wlSet[p.slug] ? 'watchlist' : 'early', age_days: age, val: val, rate: rate, ev: ev,
+        t1: stripSpec(computeFarmEconomics(p, val.implied_value_usd, 1000, snapshot.as_of)),
+        t5: stripSpec(computeFarmEconomics(p, val.implied_value_usd, 5000, snapshot.as_of)),
+        t25: stripSpec(computeFarmEconomics(p, val.implied_value_usd, 25000, snapshot.as_of)),
+        steps: buildFarmSteps(p, val.implied_value_usd, rate, snapshot.as_of)
       };
     }).sort(function (a, b) { return b.val.implied_value_usd - a.val.implied_value_usd || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0); });
 
@@ -353,11 +372,11 @@
         rank: idx + 1, rank_best: bHigh + 1, rank_worst: bLow + 1,
         slug: s.p.slug, name: s.p.name, scope: s.scope, category: s.p.category, chains: s.p.chains,
         tvl_usd: s.p.tvl_usd, change_7d: s.p.change_7d, mcap_usd: s.p.mcap_usd, listed_at: s.p.listed_at,
-        gecko_id: s.p.gecko_id, symbol: s.p.symbol, token_status: 'pre-token', age_days: s.age_days,
+        gecko_id: s.p.gecko_id, symbol: s.p.symbol, token_status: 'no-token-recorded', age_days: s.age_days,
         implied_value_usd: s.val.implied_value_usd, low_usd: s.val.low_usd, high_usd: s.val.high_usd,
-        base_tvl_usd: s.val.base_tvl_usd, cat_mult: s.val.cat_mult, cat_n: s.val.cat_n,
-        launch_odds: s.odds, expected_value_usd: s.ev, nearest_comps: s.val.nearest_comps,
-        tiers: { 1000: s.t1, 5000: s.t5, 25000: s.t25 }, farm_steps: s.steps
+        base_tvl_usd: s.val.base_tvl_usd, cat_mult: s.val.cat_mult, growth_mult: s.val.growth_mult, age_mult: s.val.age_mult,
+        cat_n: s.val.cat_n, peer_token_rate: s.rate, launch_odds: s.rate, expected_value_usd: s.ev,
+        nearest_comps: s.val.nearest_comps, tiers: { 1000: s.t1, 5000: s.t5, 25000: s.t25 }, farm_steps: s.steps
       };
     });
 
@@ -367,8 +386,8 @@
       { label: 'Watchlist', pass: board.filter(function (r) { return r.scope === 'watchlist'; }).length === snapshot.watchlist.length, detail: snapshot.watchlist.length + '/' + snapshot.watchlist.length },
       { label: 'Audit', pass: sum758 === snapshot.protocols.length, detail: sum758 + '/' + snapshot.protocols.length },
       { label: 'Monotonic', pass: mono && board.length >= 100, detail: board.length + ' rows' },
-      { label: 'CV', pass: vm.ablation[2].loo_med_mult < vm.ablation[0].loo_med_mult && vm.ablation[2].wf_med_mult < vm.ablation[0].wf_med_mult, detail: vm.ablation[2].loo_med_mult.toFixed(2) + 'x<' + vm.ablation[0].loo_med_mult.toFixed(2) + 'x' },
-      { label: 'Odds Brier', pass: om.cv_brier_model < om.cv_brier_base, detail: om.cv_brier_model.toFixed(3) + '<' + om.cv_brier_base.toFixed(3) },
+      { label: '4-Signal CV', pass: vm.ablation[4].loo_med_mult < vm.ablation[0].loo_med_mult && vm.ablation[4].wf_med_mult < vm.ablation[0].wf_med_mult, detail: vm.ablation[4].loo_med_mult.toFixed(2) + 'x<' + vm.ablation[0].loo_med_mult.toFixed(2) + 'x' },
+      { label: 'Peer Brier', pass: om.cv_brier_model < om.cv_brier_base, detail: om.cv_brier_model.toFixed(3) + '<' + om.cv_brier_base.toFixed(3) },
       { label: 'Dedup', pass: comps.length >= 100, detail: comps.length + ' comps' },
       { label: 'Hardcodes', pass: true, detail: '0' }
     ];
@@ -377,11 +396,11 @@
       radar: {
         as_of: snapshot.as_of, source: snapshot.source, floor_usd: snapshot.floor_usd, model_version: MODEL_VERSION,
         universe_counts: { total: snapshot.protocols.length, watchlist: b.watchlist.length, early_pre_token: b.early_pre_token.length, excluded_pre_token: b.excluded_pre_token.length, traded_mcap: b.traded_mcap.length, token_meta_no_mcap: b.token_meta_no_mcap.length },
-        val_model: { a: rnd(vm.a, 4), b: rnd(vm.b, 4), eb_k: vm.eb_k, comps_count: vm.comps_count, dated_count: vm.dated_count, wf_test_count: vm.wf_test_count, ablation: vm.ablation, p10_mult: rnd(Math.exp(vm.quantiles.q10), 3), p90_mult: rnd(Math.exp(vm.quantiles.q90), 3) },
+        val_model: { a: rnd(vm.a, 4), b: rnd(vm.b, 4), wg: rnd(vm.wg, 4), wa: rnd(vm.wa, 4), eb_k: vm.eb_k, ridge_reg: vm.ridge_reg, comps_count: vm.comps_count, dated_count: vm.dated_count, wf_test_count: vm.wf_test_count, ablation: vm.ablation, p10_mult: rnd(Math.exp(vm.quantiles.q10), 3), p90_mult: rnd(Math.exp(vm.quantiles.q90), 3) },
         odds_model: { pool_size: om.pool_size, token_peers: om.token_peers, pre_peers: om.pre_peers, base_rate: om.base_rate, mature_ceiling: om.mature_ceiling, age_curve: om.age_curve, cv_brier_base: om.cv_brier_base, cv_brier_model: om.cv_brier_model, cv_logloss_base: om.cv_logloss_base, cv_logloss_model: om.cv_logloss_model },
         checks: checks, rows: board,
         comps: comps.map(function (c) {
-          var pred = scoreValuation(c, vm, comps).implied_value_usd;
+          var pred = scoreValuation(c, vm, comps, snapshot.as_of).implied_value_usd;
           return { slug: c.slug, name: c.name, symbol: c.symbol, category: c.category, tvl_usd: c.tvl_usd, mcap_usd: c.mcap_usd, pred_usd: pred, ratio: rnd(c.mcap_usd / c.tvl_usd, 3), err_mult: rnd(Math.max(c.mcap_usd / pred, pred / c.mcap_usd), 2), listed_at: c.listed_at, sub_count: c.sub_count };
         }).sort(function (a, b2) { return b2.mcap_usd - a.mcap_usd; }),
         ledger: uni.tagged.map(function (t) {

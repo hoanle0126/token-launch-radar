@@ -29,6 +29,16 @@ const TEXT_MAX_BYTES = 65_536;
 const SCREENSHOT_CAPS = { max: 4, max_bytes: 524_288 };
 const IMAGE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
 
+function checkDashboardBudget(dir: string): number {
+  let total = 0;
+  for (const name of readdirSync(dir)) {
+    if (name.startsWith('.')) continue;
+    const p = join(dir, name);
+    if (statSync(p).isFile()) total += statSync(p).size;
+  }
+  return total;
+}
+
 function arg(name: string, fallback: string): string {
   const at = process.argv.indexOf(`--${name}`);
   if (at >= 0 && at + 1 < process.argv.length) return process.argv[at + 1]!;
@@ -70,7 +80,12 @@ if (issue !== null) {
 mkdirSync(out, { recursive: true });
 writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
 writeFileSync(join(out, 'data.js'), `window.RADAR=${JSON.stringify(radar)};\n`);
-const dashFiles = copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
+const dashDir = join(here, 'dashboard');
+const dashBytes = checkDashboardBudget(dashDir);
+const dashFiles = copyFiles(dashDir, join(out, 'dashboard'));
+if (dashBytes > TEXT_MAX_BYTES) {
+  process.stderr.write(`launch radar: dashboard source ${dashBytes} exceeds ${TEXT_MAX_BYTES} bytes\n`);
+}
 
 if (!prepareOnly) {
   const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
